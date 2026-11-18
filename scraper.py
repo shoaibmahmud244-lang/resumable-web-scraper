@@ -66,11 +66,11 @@ def extract(item: Tag, spec: dict[str, Any], base_url: str) -> Any:
     """Extract one field from an HTML element using selector + attr / regex / map."""
     if spec.get("all"):
         found: list[str] = []
-        for node in item.select(spec["selector"]):
+        for el in item.select(spec["selector"]):
             value = (
-                attr_text(node, spec.get("attr"))
+                attr_text(el, spec.get("attr"))
                 if "attr" in spec
-                else node.get_text(" ", strip=True)
+                else el.get_text(" ", strip=True)
             )
             if "regex" in spec:
                 match = re.search(spec["regex"], value)
@@ -81,19 +81,19 @@ def extract(item: Tag, spec: dict[str, Any], base_url: str) -> Any:
                 found.append(value)
         return ", ".join(found)
 
-    node = item.select_one(spec["selector"])
-    if node is None:
+    target = item.select_one(spec["selector"])
+    if target is None:
         return ""
     if "map" in spec:
-        key = attr_text(node, spec.get("attr", "class"))
+        key = attr_text(target, spec.get("attr", "class"))
         for token, mapped_val in spec["map"].items():
             if token in key:
                 return mapped_val
         return ""
     if "attr" in spec:
-        value = attr_text(node, spec["attr"])
+        value = attr_text(target, spec["attr"])
     else:
-        value = node.get_text(" ", strip=True)
+        value = target.get_text(" ", strip=True)
     if "regex" in spec:
         match = re.search(spec["regex"], value)
         value = match.group(1).strip() if match else ""
