@@ -1,9 +1,9 @@
-# Demo 1 — web scraper (Gig #1)
+# Config-Driven Web Scraper (Checkpointing, Deduplication, Retry)
 
 A config-driven Python scraper that turns a paginated website into a clean,
 de-duplicated CSV and a formatted `.xlsx`.
 
-Everything claimed on the gig listing is produced by this code. The run log
+Everything described below is verified and produced by this code. The run log
 below is a real execution, not an illustration.
 
 ## Files
@@ -24,9 +24,9 @@ Needs `requests` and `beautifulsoup4`; `openpyxl` is optional and enables the
 Excel export.
 
 ```bash
-/home/solonext/freelance-ai/.venv/bin/python scraper.py --all          # all sites
-/home/solonext/freelance-ai/.venv/bin/python scraper.py --site books   # one site
-/home/solonext/freelance-ai/.venv/bin/python scraper.py --all --fresh  # ignore checkpoint
+python3 scraper.py --all          # all sites
+python3 scraper.py --site books   # one site
+python3 scraper.py --all --fresh  # ignore checkpoint
 ```
 
 ## Adding a site
