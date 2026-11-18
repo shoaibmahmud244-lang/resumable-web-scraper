@@ -220,6 +220,7 @@ def to_excel(csv_path: str) -> str | None:
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
     except ImportError:
         print("    openpyxl not installed - skipping .xlsx (CSV still written)")
         return None
@@ -247,7 +248,7 @@ def to_excel(csv_path: str) -> str | None:
         width = max(
             (len(str(c.value)) for c in column if c.value is not None), default=10
         )
-        col_letter = ws.cell(row=1, column=index).column_letter
+        col_letter = get_column_letter(index)
         ws.column_dimensions[col_letter].width = min(max(width + 2, 12), 60)
 
     xlsx_path = os.path.splitext(csv_path)[0] + ".xlsx"
