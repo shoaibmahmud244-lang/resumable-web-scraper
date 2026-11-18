@@ -1,23 +1,8 @@
 #!/usr/bin/env python3
-"""Config-driven web scraper -> resumable CSV + Excel.
+"""Config-driven web scraper with page-level checkpointing and CSV/Excel export."""
 
-What this actually does (and nothing more):
-  * reads sites.json - one block per site, with its own CSS selectors
-  * paginates, politely (configurable delay), reusing one HTTP session
-  * retries transient failures with exponential backoff (429 / 5xx / timeouts)
-  * appends rows as it goes and checkpoints every page, so a crash or a
-    Ctrl-C never costs more than one page of work
-  * de-duplicates by an id field (item URL)
-  * exports CSV always, .xlsx when openpyxl is installed
+from __future__ import annotations
 
-Deliberately NOT included: user-agent spoofing, proxy rotation, CAPTCHA
-solving or any other bot-detection bypass. Scrape only what you are
-allowed to scrape, and respect the target's robots.txt and terms.
-
-Run with the venv python (has openpyxl):
-    /home/solonext/freelance-ai/.venv/bin/python scraper.py --all
-    /home/solonext/freelance-ai/.venv/bin/python scraper.py --site books --fresh
-"""
 import argparse
 import csv
 import json
@@ -25,71 +10,68 @@ import os
 import re
 import sys
 import time
+from typing import Any
 from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-UA = "PortfolioDemoScraper/2.0 (educational sandbox)"
+UA = "ResumableWebScraper/2.1 (+https://github.com/shoaibmahmud244-lang/resumable-web-scraper)"
 RETRY_STATUS = {429, 500, 502, 503, 504}
 
 
-def load_config(path):
+def load_config(path: str) -> dict[str, Any]:
     with open(path, encoding="utf-8") as fh:
-        return json.load(fh)
+        data: dict[str, Any] = json.load(fh)
+        return data
 
 
-def fetch(session, url, timeout, retries, backoff):
-    """GET with exponential backoff. Returns response text or raises."""
-    last = None
+def fetch(
+    session: requests.Session, url: str, timeout: int, retries: int, backoff: float
+) -> str:
+    """GET with exponential backoff. Returns response text or raises RuntimeError."""
+    last: Exception | None = None
     for attempt in range(retries + 1):
         try:
             resp = session.get(url, timeout=timeout)
             if resp.status_code in RETRY_STATUS:
-                raise requests.HTTPError("status %s" % resp.status_code)
+                raise requests.HTTPError(f"status {resp.status_code}")
             resp.raise_for_status()
-            # requests decodes with the header charset, defaulting to
-            # ISO-8859-1 when the server omits it. That turns a UTF-8 "£"
-            # into mojibake ("Â£"), so a price column silently loses its
-            # currency. Trust the header only when it names a real charset.
             declared = resp.encoding
             if not declared or declared.lower() in ("iso-8859-1", "latin-1", "latin"):
                 resp.encoding = resp.apparent_encoding or "utf-8"
             return resp.text
-        except Exception as exc:                      # reported, then retried
+        except Exception as exc:
             last = exc
             if attempt == retries:
                 break
-            wait = backoff * (2 ** attempt)
-            print("    retry %d/%d in %.1fs (%s)" % (attempt + 1, retries, wait, exc))
+            wait = backoff * (2**attempt)
+            print(f"    retry {attempt + 1}/{retries} in {wait:.1f}s ({exc})")
             time.sleep(wait)
-    raise RuntimeError("failed %s: %s" % (url, last))
+    raise RuntimeError(f"failed {url}: {last}")
 
 
-def attr_text(node, name):
-    """Return a tag attribute as a string.
-
-    BeautifulSoup returns multi-valued attributes (`class`, `rel`, `headers`, ...)
-    as a list, not a str. Passing that list to `re.search` raises TypeError, and
-    `"x" in ["x y"]` is False even though the token is present. Always normalise
-    before regexing or substring-matching an attribute value.
-    """
-    value = node.get(name, "") if name else ""
+def attr_text(node: Tag, name: str | None) -> str:
+    """Return a BeautifulSoup tag attribute normalised as a string."""
+    if not name:
+        return ""
+    value = node.get(name, "")
     if isinstance(value, (list, tuple)):
         return " ".join(str(v) for v in value)
-    return value or ""
+    return str(value) if value else ""
 
 
-def extract(item, spec, base_url):
-    """Pull one field out of an element using selector + attr / regex / map.
-
-    spec["all"] = true joins every match (e.g. tag lists) instead of taking the first.
-    """
+def extract(item: Tag, spec: dict[str, Any], base_url: str) -> Any:
+    """Extract one field from an HTML element using selector + attr / regex / map."""
     if spec.get("all"):
-        found = []
+        found: list[str] = []
         for node in item.select(spec["selector"]):
-            value = attr_text(node, spec.get("attr")) if "attr" in spec else node.get_text(" ", strip=True)
+            value = (
+                attr_text(node, spec.get("attr"))
+                if "attr" in spec
+                else node.get_text(" ", strip=True)
+            )
             if "regex" in spec:
                 match = re.search(spec["regex"], value)
                 value = match.group(1).strip() if match else ""
@@ -104,18 +86,15 @@ def extract(item, spec, base_url):
         return ""
     if "map" in spec:
         key = attr_text(node, spec.get("attr", "class"))
-        for token, value in spec["map"].items():
+        for token, mapped_val in spec["map"].items():
             if token in key:
-                return value
+                return mapped_val
         return ""
     if "attr" in spec:
         value = attr_text(node, spec["attr"])
     else:
         value = node.get_text(" ", strip=True)
     if "regex" in spec:
-        if spec.get("all"):
-            found = re.findall(spec["regex"], value)
-            return ", ".join(f.strip() for f in found if f.strip())
         match = re.search(spec["regex"], value)
         value = match.group(1).strip() if match else ""
     if spec.get("absolute") and value:
@@ -123,35 +102,39 @@ def extract(item, spec, base_url):
     return value
 
 
-def rows_from(html, site, page_url):
+def rows_from(html: str, site: dict[str, Any], current_url: str) -> list[dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
-    out = []
+    out: list[dict[str, Any]] = []
     for item in soup.select(site["item_selector"]):
-        row = {name: extract(item, spec, page_url) for name, spec in site["fields"].items()}
+        row = {
+            name: extract(item, spec, current_url)
+            for name, spec in site["fields"].items()
+        }
         if any(row.values()):
             out.append(row)
     return out
 
 
-def load_state(path):
+def load_state(path: str) -> dict[str, Any]:
     if os.path.exists(path):
         try:
             with open(path, encoding="utf-8") as fh:
-                return json.load(fh)
+                state: dict[str, Any] = json.load(fh)
+                return state
         except (OSError, ValueError):
             pass
     return {"pages_done": [], "rows": 0}
 
 
-def save_state(path, state):
+def save_state(path: str, state: dict[str, Any]) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(state, fh)
-    os.replace(tmp, path)                      # atomic: never a half-written state
+    os.replace(tmp, path)
 
 
-def seen_ids(csv_path, id_field, fields):
-    seen = set()
+def seen_ids(csv_path: str, id_field: str) -> set[str]:
+    seen: set[str] = set()
     if not os.path.exists(csv_path):
         return seen
     with open(csv_path, newline="", encoding="utf-8") as fh:
@@ -162,16 +145,18 @@ def seen_ids(csv_path, id_field, fields):
     return seen
 
 
-def page_url(site, page):
+def page_url(site: dict[str, Any], page: int) -> str:
     if "page_url" in site:
-        return site["page_url"].format(page=page)
-    return site["url"]
+        return str(site["page_url"]).format(page=page)
+    return str(site["url"])
 
 
-def scrape_site(site, args, session):
+def scrape_site(
+    site: dict[str, Any], args: argparse.Namespace, session: requests.Session
+) -> tuple[str, int]:
     name = site["name"]
-    out_csv = os.path.join(args.out, "%s.csv" % name)
-    state_path = os.path.join(args.out, "%s.state.json" % name)
+    out_csv = os.path.join(args.out, f"{name}.csv")
+    state_path = os.path.join(args.out, f"{name}.state.json")
     fields = list(site["fields"].keys())
     id_field = site.get("id_field", fields[0])
 
@@ -181,16 +166,19 @@ def scrape_site(site, args, session):
                 os.remove(path)
 
     state = load_state(state_path)
-    done = set(state["pages_done"])
-    seen = seen_ids(out_csv, id_field, fields)
+    done: set[int] = set(state["pages_done"])
+    seen = seen_ids(out_csv, id_field)
     new_file = not os.path.exists(out_csv) or os.path.getsize(out_csv) == 0
-    max_pages = site.get("max_pages", 1)
-    delay = site.get("delay", 0.5)
-    added = skipped = 0
-    accounted = 0                                       # rows already written into state["rows"]
+    max_pages = int(site.get("max_pages", 1))
+    delay = float(site.get("delay", 0.5))
+    added = skipped = accounted = 0
 
-    print("[%s] %d page(s) total, %d already done, resuming" % (name, max_pages, len(done)) if done
-          else "[%s] %d page(s) to scrape" % (name, max_pages))
+    status_msg = (
+        f"[{name}] {max_pages} page(s) total, {len(done)} already done, resuming"
+        if done
+        else f"[{name}] {max_pages} page(s) to scrape"
+    )
+    print(status_msg)
 
     with open(out_csv, "a", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
@@ -202,7 +190,7 @@ def scrape_site(site, args, session):
             url = page_url(site, page)
             html = fetch(session, url, args.timeout, args.retries, args.backoff)
             for row in rows_from(html, site, url):
-                key = row.get(id_field, "")
+                key = str(row.get(id_field, ""))
                 if key and key in seen:
                     skipped += 1
                     continue
@@ -210,26 +198,25 @@ def scrape_site(site, args, session):
                 if key:
                     seen.add(key)
                 added += 1
-            fh.flush()                                   # data is safe on disk now
+            fh.flush()
             done.add(page)
             state["pages_done"] = sorted(done)
-            # `added` is a run-scoped cumulative counter, so it must contribute
-            # only its per-page delta here. Adding the running total each page
-            # double-counts every row scraped after page 1.
-            state["rows"] = state.get("rows", 0) + (added - accounted)
+            state["rows"] = int(state.get("rows", 0)) + (added - accounted)
             accounted = added
             save_state(state_path, state)
-            print("    page %d/%d  rows so far: %d" % (page, max_pages, len(seen)))
+            print(f"    page {page}/{max_pages}  rows so far: {len(seen)}")
             if page < max_pages:
-                time.sleep(delay)                       # be polite, always
+                time.sleep(delay)
 
-    print("[%s] done: +%d new, %d duplicate(s) skipped, %d unique -> %s"
-          % (name, added, skipped, len(seen), out_csv))
+    print(
+        f"[{name}] done: +{added} new, {skipped} duplicate(s) skipped, "
+        f"{len(seen)} unique -> {out_csv}"
+    )
     return out_csv, len(seen)
 
 
-def to_excel(csv_path):
-    """CSV -> styled .xlsx. Returns path, or None when openpyxl is missing."""
+def to_excel(csv_path: str) -> str | None:
+    """Convert CSV to styled .xlsx when openpyxl is installed."""
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font, PatternFill
@@ -244,44 +231,52 @@ def to_excel(csv_path):
 
     wb = Workbook()
     ws = wb.active
+    assert ws is not None
     ws.title = os.path.splitext(os.path.basename(csv_path))[0][:31]
     for row in rows:
         ws.append(row)
 
-    head = ws[1]
     fill = PatternFill("solid", fgColor="0F2A43")
-    for cell in head:
+    for cell in ws[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = fill
         cell.alignment = Alignment(vertical="center")
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
     for index, column in enumerate(ws.columns, start=1):
-        width = max((len(str(c.value)) for c in column if c.value is not None), default=10)
-        ws.column_dimensions[ws.cell(row=1, column=index).column_letter].width = min(max(width + 2, 12), 60)
+        width = max(
+            (len(str(c.value)) for c in column if c.value is not None), default=10
+        )
+        col_letter = ws.cell(row=1, column=index).column_letter
+        ws.column_dimensions[col_letter].width = min(max(width + 2, 12), 60)
 
     xlsx_path = os.path.splitext(csv_path)[0] + ".xlsx"
     wb.save(xlsx_path)
-    print("    excel written: %s (%d data rows)" % (xlsx_path, len(rows) - 1))
+    print(f"    excel written: {xlsx_path} ({len(rows) - 1} data rows)")
     return xlsx_path
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Config-driven, resumable web scraper.")
     parser.add_argument("--config", default=os.path.join(HERE, "sites.json"))
     parser.add_argument("--site", help="scrape only this site name")
-    parser.add_argument("--all", action="store_true", help="scrape every site in the config")
+    parser.add_argument("--all", action="store_true", help="scrape every site in config")
     parser.add_argument("--out", default=os.path.join(HERE, "out"))
-    parser.add_argument("--fresh", action="store_true", help="discard checkpoint and start over")
+    parser.add_argument("--fresh", action="store_true", help="discard checkpoint")
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--backoff", type=float, default=1.5)
     args = parser.parse_args()
 
     sites = load_config(args.config)["sites"]
-    targets = [s for s in sites if args.site in (None, s["name"])] if (args.site or args.all) else sites
+    targets = (
+        [s for s in sites if args.site in (None, s["name"])]
+        if (args.site or args.all)
+        else sites
+    )
     if not targets:
-        sys.exit("no site matched %r (have: %s)" % (args.site, ", ".join(s["name"] for s in sites)))
+        available = ", ".join(s["name"] for s in sites)
+        sys.exit(f"no site matched {args.site!r} (have: {available})")
 
     os.makedirs(args.out, exist_ok=True)
     session = requests.Session()
@@ -290,7 +285,7 @@ def main():
     for site in targets:
         csv_path, count = scrape_site(site, args, session)
         to_excel(csv_path)
-        print("    %d unique rows\n" % count)
+        print(f"    {count} unique rows\n")
 
 
 if __name__ == "__main__":

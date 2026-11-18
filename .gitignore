@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 .venv/
 *.xlsx
+out/
+make_card.py
+scraper-proof.png
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
