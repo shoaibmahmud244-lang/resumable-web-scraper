@@ -42,7 +42,7 @@ def fetch(
             if not declared or declared.lower() in ("iso-8859-1", "latin-1", "latin"):
                 resp.encoding = resp.apparent_encoding or "utf-8"
             return resp.text
-        except Exception as exc:
+        except (requests.RequestException, RuntimeError) as exc:
             last = exc
             if attempt == retries:
                 break
