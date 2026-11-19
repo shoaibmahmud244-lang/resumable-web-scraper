@@ -11,7 +11,8 @@ import re
 import sys
 import time
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
+from urllib.robotparser import RobotFileParser
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -19,6 +20,35 @@ from bs4 import BeautifulSoup, Tag
 HERE = os.path.dirname(os.path.abspath(__file__))
 UA = "ResumableWebScraper/2.1 (+https://github.com/shoaibmahmud244-lang/resumable-web-scraper)"
 RETRY_STATUS = {429, 500, 502, 503, 504}
+_ROBOT_PARSERS: dict[str, RobotFileParser] = {}
+
+
+def is_allowed_by_robots(
+    url: str, user_agent: str = UA, timeout: int = 10, session: requests.Session | None = None
+) -> bool:
+    """Check whether the given URL is allowed by the target site's robots.txt."""
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return True
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    if origin not in _ROBOT_PARSERS:
+        rp = RobotFileParser()
+        robots_url = urljoin(origin, "/robots.txt")
+        try:
+            sess = session or requests.Session()
+            resp = sess.get(robots_url, timeout=timeout, headers={"User-Agent": user_agent})
+            if resp.status_code in (401, 403):
+                rp.disallow_all = True
+            elif resp.status_code >= 400:
+                rp.allow_all = True
+            else:
+                rp.parse(resp.text.splitlines())
+        except Exception:
+            rp.allow_all = True
+        _ROBOT_PARSERS[origin] = rp
+
+    parser = _ROBOT_PARSERS[origin]
+    return parser.can_fetch(user_agent, url)
 
 
 def load_config(path: str) -> dict[str, Any]:
@@ -188,6 +218,11 @@ def scrape_site(
             if page in done:
                 continue
             url = page_url(site, page)
+            if not getattr(args, "no_robots", False):
+                if not is_allowed_by_robots(url, user_agent=UA, session=session):
+                    raise PermissionError(
+                        f"fetch disallowed by robots.txt: {url} (override with --no-robots)"
+                    )
             html = fetch(session, url, args.timeout, args.retries, args.backoff)
             for row in rows_from(html, site, url):
                 key = str(row.get(id_field, ""))
@@ -267,6 +302,7 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--backoff", type=float, default=1.5)
+    parser.add_argument("--no-robots", action="store_true", help="bypass robots.txt checks")
     args = parser.parse_args()
 
     sites = load_config(args.config)["sites"]

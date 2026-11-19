@@ -52,7 +52,7 @@ Add a block to `sites.json`—no Python changes required:
 
 ## Scope & Ethics
 
-This tool is built for public data extraction where permitted by the site's `robots.txt` and Terms of Service. It reuses a single HTTP session with polite request delays and does not implement CAPTCHA solving, proxy rotation, or bot-detection bypass.
+This tool is built for public data extraction where permitted by the site's `robots.txt` and Terms of Service. It checks the target domain's `robots.txt` via stdlib `urllib.robotparser` before scraping each page, respects disallow directives by default, and provides an explicit `--no-robots` override for local fixtures or offline sandbox environments. It reuses a single HTTP session with polite request delays and does not implement CAPTCHA solving, proxy rotation, or bot-detection bypass.
 
 ## Verification & Automated Testing
 

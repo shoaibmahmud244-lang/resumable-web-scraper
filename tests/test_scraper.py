@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 import requests
 
-from scraper import fetch, load_state, rows_from, save_state, seen_ids
+from scraper import _ROBOT_PARSERS, fetch, is_allowed_by_robots, load_state, rows_from, save_state, seen_ids
 
 SAMPLE_HTML = """
 <html><body>
@@ -87,3 +87,14 @@ def test_fetch_raises_after_exhausting_retries() -> None:
     session.get.side_effect = requests.ConnectionError("network down")
     with pytest.raises(RuntimeError, match="failed https://example.com"):
         fetch(session, "https://example.com", timeout=5, retries=1, backoff=0.01)
+
+
+def test_is_allowed_by_robots_disallows_and_allows() -> None:
+    session = MagicMock(spec=requests.Session)
+    robots_txt = "User-agent: *\nDisallow: /admin/\nDisallow: /private/\n"
+    resp = MagicMock(status_code=200, text=robots_txt)
+    session.get.return_value = resp
+
+    _ROBOT_PARSERS.clear()
+    assert is_allowed_by_robots("https://example.com/books", user_agent="TestBot", session=session) is True
+    assert is_allowed_by_robots("https://example.com/admin/settings", user_agent="TestBot", session=session) is False
